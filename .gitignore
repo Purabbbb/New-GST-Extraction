@@ -7,3 +7,10 @@ runs/
 
 __pycache__/
 .DS_Store
+
+# Temporary and data folders
+1_page_invoice/
+outputs_new/
+table_crops/
+debug_crop.png
+tempCodeRunnerFile.py
