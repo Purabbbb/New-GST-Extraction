@@ -1,3 +1,4 @@
+import re
 import sys
 import time
 
@@ -12,7 +13,7 @@ from qr_validator import decode_and_validate, validate_and_merge, ensure_no_null
 # Config – override via CLI arg or edit here
 # ---------------------------------------------------------------------------
 
-DEFAULT_IMAGE = "1_page_invoice/AAHIN260643044_page_1.png"
+DEFAULT_IMAGE = "1_page_invoice/AAHIN260643061_page_1.png"
 IMAGE_PATH = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE
 
 _pipeline_start = time.time()
@@ -121,6 +122,39 @@ else:
     print("\nNo mismatches between OCR and QR values.")
 
 # ---------------------------------------------------------------------------
+# GSTIN-specific override: for supplier_gstin / buyer_gstin, prefer QR over
+# OCR whenever they disagree. QR is decoded from structured e-invoice data
+# and carries no ambiguity; OCR's GSTIN resolution is a line-proximity
+# heuristic that can misattribute values under two-column "Supplier |
+# Recipient" layouts (the exact failure mode that produced the swap here).
+# We still sanity-check the QR value looks like a real GSTIN before trusting
+# it, so a QR decode error can't silently corrupt a correct OCR read.
+# ---------------------------------------------------------------------------
+
+_GSTIN_SHAPE_RE = re.compile(r'^[0-3][0-9][A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$')
+
+_GSTIN_OVERRIDE_FIELDS = {"supplier_gstin", "buyer_gstin"}
+
+gstin_overrides = []
+
+for mismatch in qr_report["fields_mismatched"]:
+    field = mismatch["field"]
+    if field not in _GSTIN_OVERRIDE_FIELDS:
+        continue
+    qr_val = mismatch["qr_value"]
+    if qr_val and _GSTIN_SHAPE_RE.match(qr_val.strip().upper()):
+        invoice[field] = qr_val.strip().upper()
+        invoice.setdefault("confidence", {})[field] = max(
+            invoice.get("confidence", {}).get(field, 0.0), qr_result.get("confidence", 0.95)
+        )
+        gstin_overrides.append((field, mismatch["ocr_value"], qr_val))
+
+if gstin_overrides:
+    print("\nGSTIN fields overridden with QR value (QR outranks OCR for GSTIN):")
+    for field, ocr_val, qr_val in gstin_overrides:
+        print(f"  - {field:<20}: OCR had '{ocr_val}', now using QR '{qr_val}'")
+
+# ---------------------------------------------------------------------------
 # Determine whether GST is intra-state or inter-state
 # ---------------------------------------------------------------------------
 
@@ -183,14 +217,34 @@ for key, value in tax_details.items():
 
 # ---------------------------------------------------------------------------
 # Merge tax details into invoice
-# Do NOT overwrite existing values with None
+# Do NOT overwrite existing values with None.
+#
+# NOTE: this now LOGS any overwrite of an already-present value instead of
+# silently replacing it. Previously a tax_resolver bug that double-counted
+# subtotal/total_amount across tables silently clobbered a CORRECT
+# QR-filled total_amount with no trace in the output -- that's how the 2x
+# totals bug slipped through undetected. tax_resolver's table-classified
+# ("grand_total"-sourced) figures are still the most authoritative single
+# source for these fields, so we keep taking them, but now you'll see it
+# in the console if a future regression disagrees with QR/OCR.
 # ---------------------------------------------------------------------------
+
+_tax_source = tax_details.get("table_used", "unknown")
 
 for key, value in tax_details.items():
 
-    if value is not None:
+    if key == "table_used" or value is None:
+        continue
 
-        invoice[key] = value
+    existing = invoice.get(key)
+
+    if existing not in (None, "", 0) and existing != value:
+        print(
+            f"  NOTE: {key} changed from '{existing}' to '{value}' "
+            f"(tax_resolver source: {_tax_source})"
+        )
+
+    invoice[key] = value
 
 # ---------------------------------------------------------------------------
 # Merge confidence (optional)
